@@ -1,0 +1,346 @@
+apiVersion: v1
+data:
+  25-igmp.conf: |
+    [ovs]
+    igmp_snooping_enable = False
+kind: ConfigMap
+metadata:
+  name: neutron-igmp
+  namespace: openstack
+---
+apiVersion: v1
+data:
+  25-cpu-pinning-nova.conf: |
+    [DEFAULT]
+    reserved_host_memory_mb=4096
+    [compute]
+    cpu_shared_set=0,1,128,129
+    cpu_dedicated_set=2-15,18-127,130-255
+    [neutron]
+    physnets = dpdkdata0, dpdkdata1
+    [neutron_physnet_dpdkdata0]
+    numa_nodes = 0
+    [neutron_physnet_dpdkdata1]
+    numa_nodes = 1
+kind: ConfigMap
+metadata:
+  name: ovs-dpdk-sriov-cpu-pinning-nova
+  namespace: openstack
+---
+apiVersion: v1
+data:
+  03-sriov-nova.conf: |
+    [pci]
+    device_spec = {"address": "0000:63:00.2", "physical_network":"sriov1", "trusted":"true"}
+    device_spec = {"address": "0000:63:00.3", "physical_network":"sriov2", "trusted":"true"}
+kind: ConfigMap
+metadata:
+  name: sriov-nova
+  namespace: openstack
+---
+apiVersion: v1
+data:
+  NodeRootPassword: <password>
+kind: Secret
+metadata:
+  name: baremetalset-password-secret
+  namespace: openstack
+type: Opaque
+---
+apiVersion: v1
+data:
+  authorized_keys: <ssh-public-key>
+  ssh-privatekey: <ssh-private-key>
+  ssh-publickey: <ssh-public-key>
+kind: Secret
+metadata:
+  name: dataplane-ansible-ssh-private-key-secret
+  namespace: openstack
+type: Opaque
+---
+apiVersion: v1
+data:
+  LibvirtPassword: <password>
+kind: Secret
+metadata:
+  name: libvirt-secret
+  namespace: openstack
+type: Opaque
+---
+apiVersion: v1
+data:
+  ssh-privatekey: <ssh-private-key>
+  ssh-publickey: <ssh-public-key>
+kind: Secret
+metadata:
+  name: nova-migration-ssh-key
+  namespace: openstack
+type: kubernetes.io/ssh-auth
+---
+apiVersion: dataplane.openstack.org/v1beta1
+kind: OpenStackDataPlaneNodeSet
+metadata:
+  name: openstack-edpm
+  namespace: openstack
+spec:
+  baremetalSetTemplate:
+    bmhLabelSelector:
+      app: openstack
+    cloudUserName: cloud-admin
+    ctlplaneInterface: ens3f0np0
+    passwordSecret:
+      name: baremetalset-password-secret
+      namespace: openstack
+    provisioningInterface: enp5s0
+  env:
+  - name: ANSIBLE_FORCE_COLOR
+    value: "True"
+  networkAttachments:
+  - ctlplane
+  nodeTemplate:
+    ansible:
+      ansiblePort: 22
+      ansibleUser: cloud-admin
+      ansibleVars:
+        dns_search_domains: []
+        edpm_bootstrap_command: |-
+          #<bootstrap steps>
+        edpm_kernel_args: default_hugepagesz=1GB hugepagesz=1G hugepages=192 iommu=pt
+          amd_iommu=on isolcpus=2-127,130-255 numa_balancing=disable processor.max_cstate=0
+        edpm_network_config_hide_sensitive_logs: false
+        edpm_network_config_os_net_config_mappings:
+          edpm-compute-0:
+            nic1: 68:05:ca:bf:e3:82
+            nic2: 68:05:ca:bf:e3:83
+            nic3: 68:05:ca:bf:e3:84
+            nic4: 68:05:ca:bf:e3:85
+            nic5: 0c:42:a1:5d:a0:14
+            nic6: 0c:42:a1:5d:a0:15
+            nic7: 0c:42:a1:5d:a0:1c
+            nic8: 0c:42:a1:5d:a0:1d
+          edpm-compute-1:
+            nic1: 68:05:ca:bf:eb:4e
+            nic2: 68:05:ca:bf:eb:4f
+            nic3: 68:05:ca:bf:eb:50
+            nic4: 68:05:ca:bf:eb:51
+            nic5: 0c:42:a1:5d:a0:24
+            nic6: 0c:42:a1:5d:a0:25
+            nic7: 0c:42:a1:5d:a0:2c
+            nic8: 0c:42:a1:5d:a0:2d
+        edpm_network_config_template: |
+          ---
+          {% set mtu_list = [ctlplane_mtu] %}
+          {% for network in nodeset_networks %}
+          {{ mtu_list.append(lookup('vars', networks_lower[network] ~ '_mtu')) }}
+          {%- endfor %}
+          {% set min_viable_mtu = mtu_list | max %}
+          network_config:
+          - type: interface
+            name: nic1
+            use_dhcp: false
+
+          - type: interface
+            name: nic2
+            use_dhcp: true
+
+          - type: linux_bond
+            name: bond_api
+            bonding_options: "mode=active-backup"
+            use_dhcp: false
+            dns_servers: {{ ctlplane_dns_nameservers }}
+            members:
+            - type: interface
+              name: nic5
+            addresses:
+            - ip_netmask: {{ ctlplane_ip }}/{{ ctlplane_cidr }}
+            routes:
+            - default: true
+              next_hop: {{ ctlplane_gateway_ip }}
+
+          - type: vlan
+            vlan_id: {{ lookup('vars', networks_lower['internalapi'] ~ '_vlan_id') }}
+            device: bond_api
+            addresses:
+            - ip_netmask: {{ lookup('vars', networks_lower['internalapi'] ~ '_ip') }}/{{ lookup('vars', networks_lower['internalapi'] ~ '_cidr') }}
+
+          - type: vlan
+            vlan_id: {{ lookup('vars', networks_lower['storage'] ~ '_vlan_id') }}
+            device: bond_api
+            addresses:
+            - ip_netmask: {{ lookup('vars', networks_lower['storage'] ~ '_ip') }}/{{ lookup('vars', networks_lower['storage'] ~ '_cidr') }}
+
+          - type: ovs_user_bridge
+            name: br-link0
+            use_dhcp: false
+            ovs_extra: "set port br-link0 tag={{ lookup('vars', networks_lower['tenant'] ~ '_vlan_id') }}"
+            addresses:
+            - ip_netmask: {{ lookup('vars', networks_lower['tenant'] ~ '_ip') }}/{{ lookup('vars', networks_lower['tenant'] ~ '_cidr')}}
+            members:
+            - type: ovs_dpdk_port
+              driver: mlx5_core
+              name: dpdk0
+              mtu: 9000
+              rx_queue: 2
+              members:
+              - type: interface
+                name: nic6
+
+          - type: ovs_user_bridge
+            name: br-dpdk0
+            use_dhcp: false
+            mtu: 9000
+            members:
+            - type: ovs_dpdk_port
+              driver: mlx5_core
+              name: dpdk2
+              rx_queue: 1
+              members:
+              - type: interface
+                name: nic7
+
+          - type: ovs_user_bridge
+            name: br-dpdk1
+            use_dhcp: false
+            mtu: 9000
+            members:
+            - type: ovs_dpdk_port
+              driver: mlx5_core
+              name: dpdk3
+              rx_queue: 1
+              members:
+              - type: interface
+                name: nic8
+
+          - type: sriov_pf
+            name: nic3
+            mtu: 9000
+            numvfs: 5
+            use_dhcp: false
+            defroute: false
+            nm_controlled: true
+            hotplug: true
+            promisc: false
+
+          - type: sriov_pf
+            name: nic4
+            mtu: 9000
+            numvfs: 5
+            use_dhcp: false
+            defroute: false
+            nm_controlled: true
+            hotplug: true
+            promisc: false
+        edpm_neutron_sriov_agent_SRIOV_NIC_physical_device_mappings: sriov1:eno35,sriov2:eno36
+        edpm_nodes_validation_validate_controllers_icmp: false
+        edpm_nodes_validation_validate_gateway_icmp: false
+        edpm_nova_libvirt_qemu_group: hugetlbfs
+        edpm_ovn_bridge_mappings:
+        - dpdkmgmt:br-link0
+        - dpdkdata0:br-dpdk0
+        - dpdkdata1:br-dpdk1
+        edpm_ovs_dpdk_memory_channels: "4"
+        edpm_ovs_dpdk_pmd_core_list: 16,17,144,145
+        edpm_ovs_dpdk_socket_memory: 1024,4096,1024,1024,1024,1024,1024,1024
+        edpm_ovs_dpdk_vhost_postcopy_support: "true"
+        edpm_sshd_allowed_ranges:
+        - 192.168.122.0/24
+        edpm_sshd_configure_firewall: true
+        edpm_tuned_isolated_cores: 2-15,18-127,130-255
+        edpm_tuned_max_power_cstate: c6
+        edpm_tuned_profile: cpu-partitioning-powersave
+        gather_facts: false
+        timesync_ntp_servers:
+        - hostname: pool.ntp.org
+    ansibleSSHPrivateKeySecret: dataplane-ansible-ssh-private-key-secret
+    managementNetwork: ctlplane
+    networks:
+    - defaultRoute: true
+      name: ctlplane
+      subnetName: subnet1
+    - name: internalapi
+      subnetName: subnet1
+    - name: storage
+      subnetName: subnet1
+    - name: tenant
+      subnetName: subnet1
+  nodes:
+    edpm-compute-0:
+      hostName: compute-0
+    edpm-compute-1:
+      hostName: compute-1
+  preProvisioned: false
+  services:
+  - bootstrap
+  - download-cache
+  - reboot-os
+  - configure-ovs-dpdk
+  - configure-network
+  - validate-network
+  - install-os
+  - configure-os
+  - ssh-known-hosts
+  - run-os
+  - install-certs
+  - ovn
+  - neutron-ovn-igmp
+  - neutron-metadata
+  - neutron-sriov
+  - libvirt
+  - nova-custom-ovsdpdksriov
+  - telemetry
+---
+apiVersion: dataplane.openstack.org/v1beta1
+kind: OpenStackDataPlaneService
+metadata:
+  name: neutron-ovn-igmp
+  namespace: openstack
+spec:
+  caCerts: combined-ca-bundle
+  dataSources:
+  - configMapRef:
+      name: neutron-igmp
+  - secretRef:
+      name: neutron-ovn-agent-neutron-config
+  edpmServiceType: neutron-ovn
+  label: neutron-ovn-igmp
+  playbook: osp.edpm.neutron_ovn
+  tlsCerts:
+    default:
+      contents:
+      - dnsnames
+      - ips
+      issuer: osp-rootca-issuer-ovn
+      keyUsages:
+      - digital signature
+      - key encipherment
+      - client auth
+      networks:
+      - ctlplane
+---
+apiVersion: dataplane.openstack.org/v1beta1
+kind: OpenStackDataPlaneService
+metadata:
+  name: nova-custom-ovsdpdksriov
+  namespace: openstack
+spec:
+  caCerts: combined-ca-bundle
+  dataSources:
+  - configMapRef:
+      name: ovs-dpdk-sriov-cpu-pinning-nova
+  - configMapRef:
+      name: sriov-nova
+  - secretRef:
+      name: nova-cell1-compute-config
+  - secretRef:
+      name: nova-migration-ssh-key
+  edpmServiceType: nova
+  label: nova-custom-ovsdpdksriov
+  playbook: osp.edpm.nova
+  tlsCerts:
+    default:
+      contents:
+      - dnsnames
+      - ips
+      issuer: osp-rootca-issuer-internal
+      networks:
+      - ctlplane
